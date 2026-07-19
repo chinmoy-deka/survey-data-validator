@@ -4,34 +4,20 @@ import copy
 import re
 from collections import Counter, defaultdict
 
-from core.models import (
-    QuestionFamily,
-    QuestionType,
-    SurveyProject,
-    TableValidationResult,
-)
-from core.validation_engine import (
-    TabulationValidationEngine,
-    ValidationEngineError,
-)
+from core.models import ColumnInfo, QuestionFamily, QuestionType, SurveyProject, TableValidationResult
+from core.validation_engine import TabulationValidationEngine, ValidationEngineError
+from core.validation_strategy_engine import ValidationStrategy, ValidationStrategyEngine
 
 
 class ValidationService:
-    """Coordinates validation for the current survey project."""
+    """Coordinate matching, strategy selection, and table validation."""
 
-    GRID_ROW_PATTERN = re.compile(
-        r"^(?P<qid>.+?)_r(?P<row>\d+)$",
-        re.IGNORECASE,
-    )
+    def __init__(self) -> None:
+        self.strategy_engine = ValidationStrategyEngine()
 
     @staticmethod
     def _get_raw_dataframe(project: SurveyProject):
-        """Return the raw-data DataFrame across model versions."""
-        return getattr(
-            project,
-            "raw_dataframe",
-            getattr(project, "raw_data", None),
-        )
+        return getattr(project, "raw_dataframe", getattr(project, "raw_data", None))
 
     def validate_all(
         self,
@@ -39,62 +25,34 @@ class ValidationService:
         percentage_tolerance: float = 0.5,
         respondent_tolerance: int = 0,
     ) -> list[TableValidationResult]:
-        """Validate every imported tabulation table."""
-        raw_dataframe = self._get_raw_dataframe(project)
-        self._validate_project_state(project, raw_dataframe)
-
-        engine = TabulationValidationEngine(
-            percentage_tolerance=percentage_tolerance,
-            respondent_tolerance=respondent_tolerance,
-        )
-
-        family_index = self._build_family_index(
-            project.question_families
-        )
-
+        raw = self._get_raw_dataframe(project)
+        self._validate_project_state(project, raw)
+        raw, base_note = self._select_analysis_base(raw, project.tabulation_workbook.tables)
+        engine = TabulationValidationEngine(percentage_tolerance, respondent_tolerance)
+        family_index = self._build_family_index(project.question_families)
         tables = project.tabulation_workbook.tables
-
-        table_id_counts = Counter(
-            self._normalize_question_id(table.question_id)
-            for table in tables
-            if self._normalize_question_id(table.question_id)
-        )
-
-        occurrence_by_id: dict[str, int] = defaultdict(int)
-        results: list[TableValidationResult] = []
+        groups = self._group_tables(tables)
+        strategy_map = self._build_strategy_map(groups, list(raw.columns))
+        grid_assignment = self._build_grid_assignments(groups, strategy_map, raw)
+        occurrence = defaultdict(int)
+        results = []
 
         for table in tables:
-            normalized_id = self._normalize_question_id(
-                table.question_id
-            )
-            occurrence_index = occurrence_by_id[normalized_id]
-            occurrence_by_id[normalized_id] += 1
-
-            family = self._find_matching_family(
+            qid = self._normalize_question_id(table.question_id)
+            index = occurrence[qid]
+            occurrence[qid] += 1
+            decision = strategy_map[table.table_number]
+            family = self._prepare_family_for_strategy(
                 question_id=table.question_id,
                 family_index=family_index,
-                occurrence_index=occurrence_index,
-                total_occurrences=table_id_counts.get(
-                    normalized_id,
-                    1,
-                ),
+                raw_columns=list(raw.columns),
+                occurrence_index=index,
+                decision=decision,
+                assigned_row=grid_assignment.get(table.table_number),
             )
-
-            validation_family = self._prepare_family_for_table(
-                family=family,
-                occurrence_index=occurrence_index,
-                total_occurrences=table_id_counts.get(
-                    normalized_id,
-                    1,
-                ),
-            )
-
-            result = engine.validate_table(
-                dataframe=raw_dataframe,
-                table=table,
-                family=validation_family,
-            )
-
+            result = engine.validate_table(raw, table, family)
+            result.messages.insert(0, f"Analysis base: {base_note}")
+            result.messages.insert(0, f"Validation strategy: {decision.strategy.value}. {decision.reason}")
             results.append(result)
 
         project.validation_results = results
@@ -107,323 +65,247 @@ class ValidationService:
         percentage_tolerance: float = 0.5,
         respondent_tolerance: int = 0,
     ) -> TableValidationResult:
-        """Validate one imported tabulation table."""
-        raw_dataframe = self._get_raw_dataframe(project)
-        self._validate_project_state(project, raw_dataframe)
-
+        raw = self._get_raw_dataframe(project)
+        self._validate_project_state(project, raw)
         tables = project.tabulation_workbook.tables
-        table_position = next(
-            (
-                index
-                for index, item in enumerate(tables)
-                if item.table_number == table_number
-            ),
-            None,
+        table = next((x for x in tables if x.table_number == table_number), None)
+        if table is None:
+            raise ValidationEngineError(f"Table {table_number} was not found.")
+        raw, base_note = self._select_analysis_base(raw, tables)
+        groups = self._group_tables(tables)
+        qid = self._normalize_question_id(table.question_id)
+        group = groups[qid]
+        index = group.index(table)
+        local_strategy = self.strategy_engine.classify_group(group, list(raw.columns))
+        decision = local_strategy[table.table_number]
+        assigned_row = self._build_grid_assignments({qid: group}, local_strategy, raw).get(table.table_number)
+        family = self._prepare_family_for_strategy(
+            table.question_id,
+            self._build_family_index(project.question_families),
+            list(raw.columns),
+            index,
+            decision,
+            assigned_row=assigned_row,
         )
-
-        if table_position is None:
-            raise ValidationEngineError(
-                f"Table {table_number} was not found."
-            )
-
-        table = tables[table_position]
-        normalized_id = self._normalize_question_id(
-            table.question_id
-        )
-
-        matching_positions = [
-            index
-            for index, item in enumerate(tables)
-            if self._normalize_question_id(item.question_id)
-            == normalized_id
-        ]
-
-        occurrence_index = matching_positions.index(
-            table_position
-        )
-        total_occurrences = len(matching_positions)
-
-        family_index = self._build_family_index(
-            project.question_families
-        )
-
-        family = self._find_matching_family(
-            question_id=table.question_id,
-            family_index=family_index,
-            occurrence_index=occurrence_index,
-            total_occurrences=total_occurrences,
-        )
-
-        engine = TabulationValidationEngine(
-            percentage_tolerance=percentage_tolerance,
-            respondent_tolerance=respondent_tolerance,
-        )
-
-        validation_family = self._prepare_family_for_table(
-            family=family,
-            occurrence_index=occurrence_index,
-            total_occurrences=total_occurrences,
-        )
-
-        return engine.validate_table(
-            dataframe=raw_dataframe,
-            table=table,
-            family=validation_family,
-        )
+        result = TabulationValidationEngine(
+            percentage_tolerance, respondent_tolerance
+        ).validate_table(raw, table, family)
+        result.messages.insert(0, f"Analysis base: {base_note}")
+        result.messages.insert(0, f"Validation strategy: {decision.strategy.value}. {decision.reason}")
+        return result
 
     @staticmethod
-    def _validate_project_state(
-        project: SurveyProject,
-        raw_dataframe,
-    ) -> None:
-        if raw_dataframe is None:
-            raise ValidationEngineError(
-                "Upload the raw-data workbook first."
-            )
-
+    def _validate_project_state(project: SurveyProject, raw) -> None:
+        if raw is None:
+            raise ValidationEngineError("Upload the raw-data workbook first.")
         if project.tabulation_workbook is None:
-            raise ValidationEngineError(
-                "Import the tabulation workbook first."
-            )
-
+            raise ValidationEngineError("Import the tabulation workbook first.")
         if not project.question_families:
-            raise ValidationEngineError(
-                "No raw-data question families are available."
-            )
+            raise ValidationEngineError("No raw-data question families are available.")
 
-    def _build_family_index(
-        self,
-        families: list[QuestionFamily],
-    ) -> dict[str, object]:
-        """
-        Build two indexes:
+    def _group_tables(self, tables):
+        groups = defaultdict(list)
+        for table in tables:
+            groups[self._normalize_question_id(table.question_id)].append(table)
+        return groups
 
-        exact:
-            Final refined family name -> family or families.
+    def _build_strategy_map(self, groups, raw_columns):
+        result = {}
+        for tables in groups.values():
+            result.update(self.strategy_engine.classify_group(tables, raw_columns))
+        return result
 
-        grid_rows:
-            Base question ID -> ordered QID_r1, QID_r2, ... families.
-        """
-        exact: dict[str, list[QuestionFamily]] = {}
-        grid_rows: dict[str, list[tuple[int, QuestionFamily]]] = {}
-
+    def _build_family_index(self, families: list[QuestionFamily]):
+        index = defaultdict(list)
         for family in families:
-            family_name = self._get_family_name(family)
-            normalized_name = self._normalize_question_id(
-                family_name
-            )
+            index[self._normalize_question_id(family.name)].append(family)
+        return index
 
-            if normalized_name:
-                exact.setdefault(normalized_name, []).append(
-                    family
-                )
-
-            grid_details = self._get_grid_row_details(
-                family
-            )
-
-            if grid_details is None:
-                continue
-
-            base_id, row_number = grid_details
-            normalized_base_id = self._normalize_question_id(
-                base_id
-            )
-
-            if not normalized_base_id:
-                continue
-
-            grid_rows.setdefault(
-                normalized_base_id,
-                [],
-            ).append((row_number, family))
-
-        ordered_grid_rows: dict[
-            str,
-            list[QuestionFamily],
-        ] = {}
-
-        for base_id, row_families in grid_rows.items():
-            row_families.sort(key=lambda item: item[0])
-            ordered_grid_rows[base_id] = [
-                family
-                for _, family in row_families
-            ]
-
-        return {
-            "exact": exact,
-            "grid_rows": ordered_grid_rows,
-        }
-
-    def _find_matching_family(
+    def _prepare_family_for_strategy(
         self,
         question_id: str,
-        family_index: dict[str, object],
-        occurrence_index: int = 0,
-        total_occurrences: int = 1,
-    ) -> QuestionFamily | None:
-        """
-        Match a tabulation table to one refined family.
-
-        Rules:
-        1. A table ID such as QID_r2 matches QID_r2 exactly.
-        2. Repeated tables carrying only QID map sequentially to
-           QID_r1, QID_r2, ... in workbook order.
-        3. A non-grid question uses an exact normalized match.
-        4. Ambiguous or out-of-range matches remain unmatched.
-        """
-        normalized_question_id = self._normalize_question_id(
-            question_id
-        )
-
-        if not normalized_question_id:
-            return None
-
-        exact_index = family_index.get("exact", {})
-        grid_index = family_index.get("grid_rows", {})
-
-        exact_matches = exact_index.get(
-            normalized_question_id,
-            [],
-        )
-
-        question_is_explicit_grid_row = bool(
-            re.search(
-                r"R\d+$",
-                normalized_question_id,
-                re.IGNORECASE,
-            )
-        )
-
-        # An explicit QID_rN reference should always use its exact row.
-        if question_is_explicit_grid_row:
-            if len(exact_matches) == 1:
-                return exact_matches[0]
-            return None
-
-        row_candidates = grid_index.get(
-            normalized_question_id,
-            [],
-        )
-
-        # A tabulation-confirmed ranking uses one exact raw family for
-        # all repeated rank tables. A temporary one-column family is
-        # created later for each table occurrence.
-        ranking_matches = [
-            family
-            for family in exact_matches
-            if self._get_final_type(family) == QuestionType.RANKING
-        ]
-        if len(ranking_matches) == 1:
-            return ranking_matches[0]
-
-        # Repeated base IDs represent separate grid rows in table order.
-        if total_occurrences > 1 and row_candidates:
-            if occurrence_index < len(row_candidates):
-                return row_candidates[occurrence_index]
-            return None
-
-        # A single base-ID table may map to the only available row.
-        if len(row_candidates) == 1 and not exact_matches:
-            return row_candidates[0]
-
-        if len(exact_matches) == 1:
-            return exact_matches[0]
-
-        return None
-
-    def _get_grid_row_details(
-        self,
-        family: QuestionFamily,
-    ) -> tuple[str, int] | None:
-        """Return the base QID and row number for a refined grid row."""
-        family_name = self._get_family_name(family)
-        match = self.GRID_ROW_PATTERN.match(family_name)
-
-        if match is None:
-            return None
-
-        structural_type = str(
-            getattr(family, "structural_type", "") or ""
-        ).strip().lower()
-
-        if structural_type not in {
-            "single_select_grid_row",
-            "multi_select_grid_row",
-        }:
-            return None
-
-        return (
-            match.group("qid"),
-            int(match.group("row")),
-        )
-
-
-    def _prepare_family_for_table(
-        self,
-        family: QuestionFamily | None,
+        family_index,
+        raw_columns: list[str],
         occurrence_index: int,
-        total_occurrences: int,
+        decision,
+        assigned_row: int | None = None,
     ) -> QuestionFamily | None:
-        """Create a temporary ranking family for one rank table.
+        qid = self._normalize_question_id(question_id)
+        exact = family_index.get(qid, [])
 
-        The original ranking family keeps all option columns. Each
-        temporary copy carries a target rank (1, 2, 3, ...) so the
-        validation engine counts that rank across every option column.
-        """
-        if family is None:
-            return None
-
-        if self._get_final_type(family) != QuestionType.RANKING:
+        if decision.strategy in {ValidationStrategy.RANK_EXACT, ValidationStrategy.RANK_CUMULATIVE}:
+            if len(exact) != 1:
+                return None
+            family = copy.deepcopy(exact[0])
+            family.name = f"{exact[0].name}_rank{decision.target_rank}"
+            family.source_family_name = exact[0].name
+            family.detected_type = QuestionType.RANKING
+            family.confirmed_type = QuestionType.RANKING
+            family.structural_type = "ranking_item"
+            family.metadata["target_rank"] = int(decision.target_rank or 1)
+            family.metadata["rank_mode"] = (
+                "cumulative" if decision.strategy == ValidationStrategy.RANK_CUMULATIVE else "exact"
+            )
+            # Allow the highest captured raw rank, not merely the current displayed threshold.
+            populated = []
             return family
 
-        rank_numbers = list(
-            family.metadata.get("rank_numbers", []) or []
-        )
-        if occurrence_index < len(rank_numbers):
-            target_rank = int(rank_numbers[occurrence_index])
+        if decision.strategy == ValidationStrategy.GRID_SINGLE_SELECT:
+            row_number = assigned_row or (occurrence_index + 1)
+            wanted = re.compile(rf"^{re.escape(qid)}_?r{row_number}$", re.I)
+            columns = [c for c in raw_columns if wanted.match(c)]
+            return self._temporary_family(
+                question_id,
+                columns,
+                QuestionType.SINGLE_SELECT,
+                "single_select_grid_row",
+                {"grid_row": row_number},
+            )
+
+        if decision.strategy == ValidationStrategy.GRID_MULTI_SELECT:
+            row_number = assigned_row or (occurrence_index + 1)
+            wanted = re.compile(rf"^{re.escape(qid)}_?r{row_number}_?c(\d+)$", re.I)
+            columns = sorted(
+                [c for c in raw_columns if wanted.match(c)],
+                key=lambda c: int(wanted.match(c).group(1)),
+            )
+            return self._temporary_family(
+                question_id,
+                columns,
+                QuestionType.MULTI_SELECT,
+                "multi_select_grid_row",
+                {"grid_row": row_number},
+            )
+
+        if decision.strategy in {ValidationStrategy.TOP_2_BOX, ValidationStrategy.BOTTOM_2_BOX}:
+            columns = self._find_row_columns(question_id, raw_columns)
+            return self._temporary_family(
+                question_id,
+                columns,
+                QuestionType.RATING_SCALE,
+                "derived_box",
+                {
+                    "box_mode": "top2" if decision.strategy == ValidationStrategy.TOP_2_BOX else "bottom2"
+                },
+            )
+
+        if len(exact) == 1:
+            family = exact[0]
+            # A displayed option table backed by one physical column is
+            # a direct coded frequency table, even when raw-value heuristics
+            # labelled the column Numeric Entry or Rating Scale.
+            if len(family.column_names) == 1:
+                temporary = copy.deepcopy(family)
+                temporary.detected_type = QuestionType.SINGLE_SELECT
+                temporary.confirmed_type = QuestionType.SINGLE_SELECT
+                temporary.structural_type = "single_select"
+                return temporary
+            return family
+        return None
+
+    def _build_grid_assignments(self, groups, strategy_map, raw):
+        assignments = {}
+        for qid, tables in groups.items():
+            if not tables:
+                continue
+            strategy = strategy_map[tables[0].table_number].strategy
+            if strategy not in {ValidationStrategy.GRID_SINGLE_SELECT, ValidationStrategy.GRID_MULTI_SELECT}:
+                continue
+            rows = self._available_grid_rows(qid, list(raw.columns), strategy)
+            if not rows:
+                continue
+            costs = []
+            for table in tables:
+                costs.append([self._grid_match_cost(table, raw, qid, row, strategy) for row in rows])
+            try:
+                from scipy.optimize import linear_sum_assignment
+                row_idx, col_idx = linear_sum_assignment(costs)
+                for i, j in zip(row_idx, col_idx):
+                    assignments[tables[int(i)].table_number] = rows[int(j)]
+            except Exception:
+                unused = set(rows)
+                for table, row_costs in zip(tables, costs):
+                    choices = [(cost, row) for cost, row in zip(row_costs, rows) if row in unused]
+                    if choices:
+                        _, selected = min(choices)
+                        assignments[table.table_number] = selected
+                        unused.remove(selected)
+        return assignments
+
+    @staticmethod
+    def _available_grid_rows(qid, columns, strategy):
+        if strategy == ValidationStrategy.GRID_SINGLE_SELECT:
+            pattern = re.compile(rf"^{re.escape(qid)}_?r(\d+)$", re.I)
         else:
-            target_rank = occurrence_index + 1
+            pattern = re.compile(rf"^{re.escape(qid)}_?r(\d+)_?c\d+$", re.I)
+        return sorted({int(pattern.match(c).group(1)) for c in columns if pattern.match(c)})
 
-        temporary_family = copy.deepcopy(family)
-        temporary_family.name = f"{family.name}_rank{target_rank}"
-        temporary_family.detected_type = QuestionType.RANKING
-        temporary_family.confirmed_type = QuestionType.RANKING
-        temporary_family.structural_type = "ranking_item"
-        temporary_family.source_family_name = family.name
-        temporary_family.metadata["target_rank"] = target_rank
-        temporary_family.metadata["ranking_occurrence"] = (
-            occurrence_index + 1
+    @staticmethod
+    def _grid_match_cost(table, raw, qid, row, strategy):
+        reported = [o.reported_percentage for o in table.options]
+        if strategy == ValidationStrategy.GRID_SINGLE_SELECT:
+            pattern = re.compile(rf"^{re.escape(qid)}_?r{row}$", re.I)
+            column = next((c for c in raw.columns if pattern.match(c)), None)
+            if column is None:
+                return 1e9
+            series = raw[column]
+            numeric = __import__('pandas').to_numeric(series, errors='coerce')
+            base = int(numeric.notna().sum())
+            calculated = [100 * int((numeric == i + 1).sum()) / base if base else 0 for i in range(len(reported))]
+        else:
+            pattern = re.compile(rf"^{re.escape(qid)}_?r{row}_?c(\d+)$", re.I)
+            columns = sorted([c for c in raw.columns if pattern.match(c)], key=lambda c: int(pattern.match(c).group(1)))
+            base = len(raw)
+            calculated = [100 * int((__import__('pandas').to_numeric(raw[c], errors='coerce') == 1).sum()) / base for c in columns]
+        diffs = [abs(float(r) - float(c)) for r, c in zip(reported, calculated) if r is not None]
+        profile_cost = sum(diffs) / len(diffs) if diffs else 1000
+        base_cost = 0
+        if table.total_respondents is not None:
+            base_cost = abs(base - int(table.total_respondents)) * 2
+        return profile_cost + base_cost
+
+    def _find_row_columns(self, question_id: str, raw_columns: list[str]) -> list[str]:
+        qid = self._normalize_question_id(question_id)
+        pattern = re.compile(rf"^{re.escape(qid)}_?r(\d+)$", re.I)
+        matches = [(int(pattern.match(c).group(1)), c) for c in raw_columns if pattern.match(c)]
+        return [c for _, c in sorted(matches)]
+
+    @staticmethod
+    def _temporary_family(name, columns, qtype, structural_type, metadata):
+        if not columns:
+            return None
+        infos = [
+            ColumnInfo(index=i, name=column, dtype="unknown", family=name)
+            for i, column in enumerate(columns)
+        ]
+        return QuestionFamily(
+            name=name,
+            columns=infos,
+            detected_type=qtype,
+            confirmed_type=qtype,
+            confidence=1.0,
+            reason="Created by validation strategy engine.",
+            grouping_method="validation_strategy",
+            structural_type=structural_type,
+            source_family_name=name,
+            metadata=metadata,
         )
-        temporary_family.metadata["ranking_source_family"] = family.name
-        return temporary_family
 
     @staticmethod
-    def _get_final_type(family: QuestionFamily) -> QuestionType:
-        return family.confirmed_type or family.detected_type
-
-    @staticmethod
-    def _column_order(column_name: str) -> tuple[int, str]:
-        match = re.search(r"_(?:r|c)?(\d+)$", str(column_name), re.IGNORECASE)
-        if match:
-            return int(match.group(1)), str(column_name).lower()
-        return 10**9, str(column_name).lower()
-
-    @staticmethod
-    def _get_family_name(family: QuestionFamily) -> str:
-        for attribute_name in (
-            "name",
-            "family_name",
-            "question_id",
-        ):
-            value = getattr(family, attribute_name, None)
-            if value:
-                return str(value)
-
-        return ""
+    def _select_analysis_base(raw, tables):
+        """Restrict validation to the completion status matching the modal reported base."""
+        reported = [int(t.total_respondents) for t in tables if t.total_respondents]
+        if not reported or "sys_RespStatus" not in raw.columns:
+            return raw, f"all {len(raw)} raw records (no completion-status match available)."
+        modal_base = Counter(reported).most_common(1)[0][0]
+        counts = raw["sys_RespStatus"].value_counts(dropna=False)
+        exact = [value for value, count in counts.items() if int(count) == modal_base]
+        if len(exact) == 1:
+            status = exact[0]
+            filtered = raw[raw["sys_RespStatus"] == status].copy()
+            return filtered, f"{len(filtered)} completed records selected where sys_RespStatus = {status}; this matches the modal reported base {modal_base}."
+        return raw, f"all {len(raw)} raw records; no unique sys_RespStatus count matched modal reported base {modal_base}."
 
     @staticmethod
     def _normalize_question_id(value: str) -> str:
-        """Normalize separators while preserving letters and numbers."""
-        text = str(value or "").strip().upper()
-        return re.sub(r"[^A-Z0-9]", "", text)
+        return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())

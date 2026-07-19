@@ -32,6 +32,11 @@ class TabulationValidationEngine:
         "single_select_grid_row",
     }
     RANKING_STRUCTURES = {"ranking_item"}
+    DERIVED_BOX_STRUCTURES = {"derived_box"}
+    PERCENTAGE_ALLOCATION_TYPES = {
+        "percentage allocation",
+        "percentage-allocation",
+    }
     MULTI_SELECT_TYPES = {
         "multi select",
         "multi-select",
@@ -137,12 +142,26 @@ class TabulationValidationEngine:
                             "target_rank", 1
                         )
                     ),
-                    maximum_rank=max(
-                        getattr(family, "metadata", {}).get(
-                            "rank_numbers", [1]
-                        )
-                        or [1]
-                    ),
+                    maximum_rank=self._infer_maximum_rank(family_dataframe),
+                    rank_mode=str(getattr(family, "metadata", {}).get("rank_mode", "exact")),
+                )
+            )
+        elif structural_type in self.DERIVED_BOX_STRUCTURES:
+            option_results, validation_messages = self._validate_derived_box(
+                dataframe=family_dataframe,
+                table=table,
+                box_mode=str(getattr(family, "metadata", {}).get("box_mode", "top2")),
+            )
+            # Box tables use per-item bases; a single family-wide base is not meaningful.
+            calculated_respondents = table.total_respondents
+            respondent_difference, respondent_status = self._validate_respondent_count(
+                reported=table.total_respondents, calculated=calculated_respondents
+            )
+        elif normalized_type in self.PERCENTAGE_ALLOCATION_TYPES:
+            option_results, validation_messages = (
+                self._validate_percentage_allocation(
+                    dataframe=family_dataframe,
+                    table=table,
                 )
             )
         elif (
@@ -218,6 +237,7 @@ class TabulationValidationEngine:
         respondent_base: int,
         target_rank: int,
         maximum_rank: int,
+        rank_mode: str = "exact",
     ) -> tuple[list[OptionValidationResult], list[str]]:
         """Validate one displayed rank table across option columns.
 
@@ -226,8 +246,10 @@ class TabulationValidationEngine:
         was not ranked within the captured range.
         """
         messages = [
-            f"Ranking table mapped to raw value {target_rank} across "
-            "the option columns in numeric column order."
+            (f"Ranking table mapped cumulatively to raw values 1 through {target_rank} across "
+             "the option columns in numeric column order."
+             if rank_mode == "cumulative" else
+             f"Ranking table mapped to raw value {target_rank} across the option columns in numeric column order.")
         ]
         options = list(table.options)
         columns = self._sort_columns_by_option_number(
@@ -277,8 +299,7 @@ class TabulationValidationEngine:
             if option is None and column is not None:
                 count = int(
                     dataframe[column].apply(
-                        lambda value: self._to_finite_number(value)
-                        == target_rank
+                        lambda value: self._ranking_value_matches(value, target_rank, rank_mode)
                     ).sum()
                 )
                 results.append(
@@ -324,8 +345,7 @@ class TabulationValidationEngine:
 
             count = int(
                 dataframe[column].apply(
-                    lambda value: self._to_finite_number(value)
-                    == target_rank
+                    lambda value: self._ranking_value_matches(value, target_rank, rank_mode)
                 ).sum()
             )
             percentage = self._calculate_percentage(
@@ -337,7 +357,7 @@ class TabulationValidationEngine:
             )
             message = (
                 f"Mapped by position: {column} is option {index + 1}; "
-                f"counted responses coded {target_rank}."
+                + (f"counted responses coded 1 through {target_rank}." if rank_mode == "cumulative" else f"counted responses coded {target_rank}.")
             )
             if invalid_count:
                 status = ValidationStatus.FAIL
@@ -363,26 +383,251 @@ class TabulationValidationEngine:
 
         return results, messages
 
+
+    def _validate_derived_box(
+        self,
+        dataframe: pd.DataFrame,
+        table: TabulationTable,
+        box_mode: str,
+    ) -> tuple[list[OptionValidationResult], list[str]]:
+        """Validate Top-2/Bottom-2 box percentages for row variables."""
+        columns = self._sort_columns_by_option_number(list(dataframe.columns))
+        options = list(table.options)
+        numeric = dataframe.apply(pd.to_numeric, errors="coerce")
+        populated = numeric.stack().dropna()
+        if populated.empty:
+            return [], ["No populated scale values were available for box validation."]
+        scale_min = int(populated.min())
+        scale_max = int(populated.max())
+        if box_mode == "top2":
+            accepted = {scale_max - 1, scale_max}
+            label = f"Top 2 Box ({scale_max - 1}, {scale_max})"
+        else:
+            accepted = {scale_min, scale_min + 1}
+            label = f"Bottom 2 Box ({scale_min}, {scale_min + 1})"
+        messages = [f"{label} calculated independently for each raw row variable using its nonblank base."]
+        results = []
+        pair_count = max(len(options), len(columns))
+        for index in range(pair_count):
+            option = options[index] if index < len(options) else None
+            column = columns[index] if index < len(columns) else None
+            if option is None or column is None:
+                results.append(OptionValidationResult(
+                    option_label=option.label if option else "[Missing tabulation option]",
+                    raw_variable=column, reported_value=option.reported_value if option else None,
+                    reported_percentage=option.reported_percentage if option else None,
+                    calculated_count=None, calculated_percentage=None, difference=None,
+                    status=ValidationStatus.UNMATCHED, message="Box option and raw row variable could not be paired by position."
+                ))
+                continue
+            series = pd.to_numeric(dataframe[column], errors="coerce")
+            base = int(series.notna().sum())
+            count = int(series.isin(accepted).sum())
+            percentage = self._calculate_percentage(count, base)
+            difference, status = self._compare_percentage(option.reported_percentage, percentage)
+            results.append(OptionValidationResult(
+                option_label=option.label, raw_variable=column, raw_value=label,
+                reported_value=option.reported_value, reported_percentage=option.reported_percentage,
+                calculated_count=count, calculated_percentage=percentage, difference=difference,
+                status=status, message=f"Calculated from {base} nonblank responses in {column}."
+            ))
+        return results, messages
+
+    @staticmethod
+    def _ranking_value_matches(value, target_rank: int, rank_mode: str) -> bool:
+        numeric = TabulationValidationEngine._to_finite_number(value)
+        if numeric is None or not float(numeric).is_integer():
+            return False
+        code = int(numeric)
+        return 1 <= code <= target_rank if rank_mode == "cumulative" else code == target_rank
+
+    @staticmethod
+    def _infer_maximum_rank(dataframe: pd.DataFrame) -> int:
+        numeric = dataframe.apply(pd.to_numeric, errors="coerce").stack().dropna()
+        if numeric.empty:
+            return 1
+        return max(1, int(numeric.max()))
+
+    def _validate_percentage_allocation(
+        self,
+        dataframe: pd.DataFrame,
+        table: TabulationTable,
+    ) -> tuple[list[OptionValidationResult], list[str]]:
+        """Validate percentage-allocation questions using column means.
+
+        Each raw column is an allocation option and each completed row
+        should normally total approximately 100. Displayed percentages
+        are compared with the mean nonblank allocation for each column.
+        """
+        options = list(table.options)
+        columns = self._sort_columns_by_option_number(list(dataframe.columns))
+        numeric = dataframe.apply(pd.to_numeric, errors="coerce")
+
+        messages = [
+            "Percentage-allocation variables were mapped to displayed options "
+            "by numeric column order and validated using column means."
+        ]
+
+        if len(options) != len(columns):
+            messages.append(
+                f"The tabulation contains {len(options)} options, while the "
+                f"raw-data family contains {len(columns)} variables."
+            )
+
+        # Integrity check: only rows with at least one populated allocation are assessed.
+        populated_rows = numeric.notna().any(axis=1)
+        row_sums = numeric.loc[populated_rows].sum(axis=1, min_count=1)
+        if not row_sums.empty:
+            row_total_tolerance = 0.5
+            valid_total_mask = (row_sums - 100.0).abs() <= row_total_tolerance
+            invalid_total_count = int((~valid_total_mask).sum())
+            if invalid_total_count:
+                preview = ", ".join(
+                    f"{value:.2f}" for value in row_sums[~valid_total_mask].head(5)
+                )
+                messages.append(
+                    f"{invalid_total_count} respondent row(s) do not total "
+                    f"100±{row_total_tolerance:g}. Example totals: {preview}."
+                )
+            else:
+                messages.append(
+                    f"All {len(row_sums)} populated respondent rows total "
+                    f"100±{row_total_tolerance:g}."
+                )
+
+        reported_values = [
+            option.reported_percentage
+            for option in options
+            if option.reported_percentage is not None
+        ]
+        if reported_values:
+            reported_total = float(sum(reported_values))
+            if abs(reported_total - 100.0) <= 1.0:
+                messages.append(
+                    f"Displayed option percentages total {reported_total:.2f}%."
+                )
+            else:
+                messages.append(
+                    f"Displayed option percentages total {reported_total:.2f}%, "
+                    "which is not approximately 100%."
+                )
+
+        results: list[OptionValidationResult] = []
+        pair_count = max(len(options), len(columns))
+        for index in range(pair_count):
+            option = options[index] if index < len(options) else None
+            column = columns[index] if index < len(columns) else None
+
+            if option is None and column is not None:
+                series = numeric[column].dropna()
+                mean_value = float(series.mean()) if not series.empty else None
+                results.append(
+                    OptionValidationResult(
+                        option_label="[Missing tabulation option]",
+                        raw_variable=column,
+                        raw_value="Mean allocation",
+                        reported_value=None,
+                        reported_percentage=None,
+                        calculated_count=int(series.size),
+                        calculated_percentage=mean_value,
+                        difference=None,
+                        status=ValidationStatus.UNMATCHED,
+                        message="Raw allocation variable has no corresponding displayed option.",
+                    )
+                )
+                continue
+
+            if option is not None and column is None:
+                results.append(
+                    OptionValidationResult(
+                        option_label=option.label,
+                        raw_variable=None,
+                        raw_value="Mean allocation",
+                        reported_value=option.reported_value,
+                        reported_percentage=option.reported_percentage,
+                        calculated_count=None,
+                        calculated_percentage=None,
+                        difference=None,
+                        status=ValidationStatus.UNMATCHED,
+                        message="No raw allocation variable exists at this displayed position.",
+                    )
+                )
+                continue
+
+            series = numeric[column].dropna()
+            mean_value = float(series.mean()) if not series.empty else None
+            difference, status = self._compare_percentage(
+                reported_percentage=option.reported_percentage,
+                calculated_percentage=mean_value,
+            )
+            invalid_range = int(((series < 0) | (series > 100)).sum())
+            message = (
+                f"Mapped by position: {column} is option {index + 1}; "
+                f"mean calculated from {len(series)} nonblank allocations."
+            )
+            if invalid_range:
+                status = ValidationStatus.FAIL
+                message += (
+                    f" {invalid_range} value(s) fall outside the permitted "
+                    "0–100 allocation range."
+                )
+
+            results.append(
+                OptionValidationResult(
+                    option_label=option.label,
+                    raw_variable=column,
+                    raw_value="Mean allocation",
+                    reported_value=option.reported_value,
+                    reported_percentage=option.reported_percentage,
+                    calculated_count=int(series.size),
+                    calculated_percentage=mean_value,
+                    difference=difference,
+                    status=status,
+                    message=message,
+                )
+            )
+
+        return results, messages
+
     def _validate_multi_select(
         self,
         dataframe: pd.DataFrame,
         table: TabulationTable,
         respondent_base: int,
     ) -> tuple[list[OptionValidationResult], list[str]]:
-        """
-        Map raw variables to displayed options by numeric column order.
+        """Validate a binary multi-select table.
 
-        Example: CQ_1 -> first option, CQ_2 -> second option.
-        Only 0, 1, and blank values are valid.
+        Two denominator conventions are supported:
+
+        * common family base: selected count / respondents with any
+          populated value in the family;
+        * option-specific base: selected count / nonblank responses in
+          the individual option column.
+
+        The option-specific convention is selected only when column
+        bases genuinely vary and it gives a materially better match to
+        the reported table. This avoids treating ordinary blanks as an
+        option-level filter without evidence.
         """
-        messages = [
-            "Multi-select variables were mapped to tabulation options "
-            "by numeric column order."
-        ]
         options = list(table.options)
         columns = self._sort_columns_by_option_number(
             list(dataframe.columns)
         )
+
+        denominator_strategy, strategy_details = (
+            self._select_multi_select_denominator_strategy(
+                dataframe=dataframe,
+                options=options,
+                columns=columns,
+                common_base=respondent_base,
+            )
+        )
+
+        messages = [
+            "Multi-select variables were mapped to tabulation options "
+            "by numeric column order.",
+            strategy_details,
+        ]
 
         if len(options) != len(columns):
             messages.append(
@@ -398,14 +643,29 @@ class TabulationValidationEngine:
             option = options[index] if index < len(options) else None
             column = columns[index] if index < len(columns) else None
 
-            if option is None and column is not None:
+            if column is not None:
                 selected_count, invalid_count = (
                     self._count_strict_binary_values(dataframe[column])
                 )
-                calculated_percentage = self._calculate_percentage(
-                    selected_count,
-                    respondent_base,
+                option_base = self._calculate_column_nonblank_base(
+                    dataframe[column]
                 )
+                denominator = (
+                    option_base
+                    if denominator_strategy == "option_nonblank_base"
+                    else respondent_base
+                )
+                calculated_percentage = self._calculate_percentage(
+                    selected_count, denominator
+                )
+            else:
+                selected_count = None
+                invalid_count = 0
+                option_base = None
+                denominator = None
+                calculated_percentage = None
+
+            if option is None and column is not None:
                 option_results.append(
                     OptionValidationResult(
                         option_label="[Missing tabulation option]",
@@ -418,7 +678,8 @@ class TabulationValidationEngine:
                         status=ValidationStatus.UNMATCHED,
                         message=(
                             "Raw-data variable has no corresponding "
-                            "tabulation option."
+                            "tabulation option. "
+                            f"Denominator used: {denominator}."
                             + (
                                 f" It also contains {invalid_count} "
                                 "invalid nonblank value(s)."
@@ -449,20 +710,19 @@ class TabulationValidationEngine:
                 )
                 continue
 
-            selected_count, invalid_count = (
-                self._count_strict_binary_values(dataframe[column])
-            )
-            calculated_percentage = self._calculate_percentage(
-                selected_count,
-                respondent_base,
-            )
             difference, status = self._compare_percentage(
                 reported_percentage=option.reported_percentage,
                 calculated_percentage=calculated_percentage,
             )
 
+            denominator_label = (
+                f"option-specific nonblank base {option_base}"
+                if denominator_strategy == "option_nonblank_base"
+                else f"common family base {respondent_base}"
+            )
             message = (
-                f"Mapped by position: {column} is option {index + 1}."
+                f"Mapped by position: {column} is option {index + 1}; "
+                f"calculated using {denominator_label}."
             )
             if invalid_count:
                 status = ValidationStatus.FAIL
@@ -486,6 +746,106 @@ class TabulationValidationEngine:
             )
 
         return option_results, messages
+
+    def _select_multi_select_denominator_strategy(
+        self,
+        dataframe: pd.DataFrame,
+        options: list,
+        columns: list[str],
+        common_base: int,
+    ) -> tuple[str, str]:
+        """Choose a denominator convention using guarded evidence."""
+        paired = min(len(options), len(columns))
+        if paired == 0:
+            return (
+                "common_family_base",
+                f"Denominator strategy: common family base ({common_base}); "
+                "there were no paired options available for comparison.",
+            )
+
+        common_differences: list[float] = []
+        option_differences: list[float] = []
+        option_bases: list[int] = []
+
+        for index in range(paired):
+            reported = options[index].reported_percentage
+            if reported is None:
+                continue
+
+            selected_count, invalid_count = (
+                self._count_strict_binary_values(dataframe[columns[index]])
+            )
+            if invalid_count:
+                continue
+
+            option_base = self._calculate_column_nonblank_base(
+                dataframe[columns[index]]
+            )
+            option_bases.append(option_base)
+
+            common_percentage = self._calculate_percentage(
+                selected_count, common_base
+            )
+            option_percentage = self._calculate_percentage(
+                selected_count, option_base
+            )
+
+            if common_percentage is not None:
+                common_differences.append(
+                    abs(float(reported) - float(common_percentage))
+                )
+            if option_percentage is not None:
+                option_differences.append(
+                    abs(float(reported) - float(option_percentage))
+                )
+
+        if not common_differences or not option_differences:
+            return (
+                "common_family_base",
+                f"Denominator strategy: common family base ({common_base}); "
+                "insufficient reported percentages were available to "
+                "justify an option-specific denominator.",
+            )
+
+        common_mae = sum(common_differences) / len(common_differences)
+        option_mae = sum(option_differences) / len(option_differences)
+        distinct_bases = sorted(set(option_bases))
+        bases_vary = (
+            len(distinct_bases) > 1
+            and (max(distinct_bases) - min(distinct_bases)) >= 1
+        )
+        material_improvement = (
+            common_mae - option_mae
+            >= max(0.25, self.percentage_tolerance / 2)
+        )
+        option_matches = option_mae <= self.percentage_tolerance
+
+        if bases_vary and material_improvement and option_matches:
+            preview = ", ".join(str(value) for value in distinct_bases[:8])
+            if len(distinct_bases) > 8:
+                preview += ", ..."
+            return (
+                "option_nonblank_base",
+                "Denominator strategy: option-specific nonblank base. "
+                f"Column bases vary ({preview}); mean absolute error "
+                f"improved from {common_mae:.3f} to {option_mae:.3f} "
+                "percentage points. Blanks are therefore treated as "
+                "not applicable for the affected option, not as zero.",
+            )
+
+        return (
+            "common_family_base",
+            f"Denominator strategy: common family base ({common_base}). "
+            f"Common-base MAE was {common_mae:.3f} and option-base MAE "
+            f"was {option_mae:.3f} percentage points; guarded selection "
+            "did not find sufficient evidence to change denominators.",
+        )
+
+    def _calculate_column_nonblank_base(
+        self,
+        series: pd.Series,
+    ) -> int:
+        return int(self._nonblank_mask(series).sum())
 
     def _validate_single_select(
         self,
@@ -771,7 +1131,7 @@ class TabulationValidationEngine:
             if grid_match:
                 return (0, int(grid_match.group(1)), text.lower())
 
-            option_match = re.search(r"_(\d+)$", text)
+            option_match = re.search(r"_(?:r|c)?(\d+)$", text, re.IGNORECASE)
             if option_match:
                 return (0, int(option_match.group(1)), text.lower())
 

@@ -6,6 +6,7 @@ from core.models import SurveyProject
 from ui.dictionary_editor import render_dictionary_editor
 from ui.raw_data_page import render_raw_data_page
 from ui.tabulation_page import render_tabulation_page
+from ui.question_details_page import render_question_details_page
 from ui.validation_page import render_validation_page
 
 
@@ -109,11 +110,7 @@ def main() -> None:
         render_tabulation_page()
 
     elif selected_page == "Question Details":
-        render_placeholder_page(
-            "Question Details",
-            "Detailed profiling and validation-rule "
-            "suggestions will be implemented next.",
-        )
+        render_question_details_page()
 
     elif selected_page == "Validation":
         render_validation_page()
