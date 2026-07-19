@@ -9,6 +9,9 @@ from core.models import (
     SurveyProject,
     TabulationWorkbook,
 )
+from services.question_classification_service import (
+    QuestionClassificationService,
+)
 from core.tabulation_parser import (
     TabulationParser,
     TabulationParserError,
@@ -20,6 +23,7 @@ class TabulationService:
 
     def __init__(self) -> None:
         self.parser = TabulationParser()
+        self.classification_service = QuestionClassificationService()
 
     def get_sheet_names(
         self,
@@ -78,6 +82,7 @@ class TabulationService:
         )
 
         project.validation_results = []
+        self.classification_service.classify_project(project)
 
         return project
 

@@ -31,6 +31,7 @@ class TabulationValidationEngine:
         "single_select",
         "single_select_grid_row",
     }
+    RANKING_STRUCTURES = {"ranking_item"}
     MULTI_SELECT_TYPES = {
         "multi select",
         "multi-select",
@@ -40,6 +41,7 @@ class TabulationValidationEngine:
     SINGLE_SELECT_TYPES = {
         "single select",
         "single-select",
+        "ranking",
     }
 
     def __init__(
@@ -124,7 +126,26 @@ class TabulationValidationEngine:
         normalized_type = self._normalize_text(question_type)
         messages = list(getattr(table, "warnings", []) or [])
 
-        if (
+        if structural_type in self.RANKING_STRUCTURES:
+            option_results, validation_messages = (
+                self._validate_ranking_table(
+                    dataframe=family_dataframe,
+                    table=table,
+                    respondent_base=calculated_respondents,
+                    target_rank=int(
+                        getattr(family, "metadata", {}).get(
+                            "target_rank", 1
+                        )
+                    ),
+                    maximum_rank=max(
+                        getattr(family, "metadata", {}).get(
+                            "rank_numbers", [1]
+                        )
+                        or [1]
+                    ),
+                )
+            )
+        elif (
             structural_type in self.MULTI_SELECT_STRUCTURES
             or normalized_type in self.MULTI_SELECT_TYPES
         ):
@@ -153,6 +174,11 @@ class TabulationValidationEngine:
                         raw_variable=existing_columns[0],
                         table=table,
                         respondent_base=calculated_respondents,
+                        mapping_label=(
+                            "Ranking response codes"
+                            if structural_type == "ranking_item"
+                            else "Single-select response codes"
+                        ),
                     )
                 )
         else:
@@ -184,6 +210,158 @@ class TabulationValidationEngine:
             overall_status=overall_status,
             messages=messages,
         )
+
+    def _validate_ranking_table(
+        self,
+        dataframe: pd.DataFrame,
+        table: TabulationTable,
+        respondent_base: int,
+        target_rank: int,
+        maximum_rank: int,
+    ) -> tuple[list[OptionValidationResult], list[str]]:
+        """Validate one displayed rank table across option columns.
+
+        Each raw column represents one answer option. A populated value
+        of 1 means Rank-1, 2 means Rank-2, and so on; 0 means the option
+        was not ranked within the captured range.
+        """
+        messages = [
+            f"Ranking table mapped to raw value {target_rank} across "
+            "the option columns in numeric column order."
+        ]
+        options = list(table.options)
+        columns = self._sort_columns_by_option_number(
+            list(dataframe.columns)
+        )
+
+        if len(options) != len(columns):
+            messages.append(
+                f"The tabulation contains {len(options)} options, "
+                f"while the ranking family contains {len(columns)} "
+                "raw option variables."
+            )
+
+        invalid_values: dict[str, int] = {}
+        for column in columns:
+            for value in dataframe[column].tolist():
+                if self._is_blank(value):
+                    continue
+                numeric = self._to_finite_number(value)
+                valid = (
+                    numeric is not None
+                    and float(numeric).is_integer()
+                    and 0 <= int(numeric) <= maximum_rank
+                )
+                if not valid:
+                    key = str(value)
+                    invalid_values[key] = invalid_values.get(key, 0) + 1
+
+        invalid_count = sum(invalid_values.values())
+        if invalid_count:
+            preview = ", ".join(
+                f"{value!r} ({count})"
+                for value, count in list(invalid_values.items())[:5]
+            )
+            messages.append(
+                f"{invalid_count} invalid ranking value(s) were found: "
+                f"{preview}. Permitted populated codes are 0 through "
+                f"{maximum_rank}."
+            )
+
+        results: list[OptionValidationResult] = []
+        pair_count = max(len(options), len(columns))
+        for index in range(pair_count):
+            option = options[index] if index < len(options) else None
+            column = columns[index] if index < len(columns) else None
+
+            if option is None and column is not None:
+                count = int(
+                    dataframe[column].apply(
+                        lambda value: self._to_finite_number(value)
+                        == target_rank
+                    ).sum()
+                )
+                results.append(
+                    OptionValidationResult(
+                        option_label="[Missing tabulation option]",
+                        raw_variable=column,
+                        raw_value=target_rank,
+                        reported_value=None,
+                        reported_percentage=None,
+                        calculated_count=count,
+                        calculated_percentage=self._calculate_percentage(
+                            count, respondent_base
+                        ),
+                        difference=None,
+                        status=ValidationStatus.UNMATCHED,
+                        message=(
+                            "Raw ranking option variable has no "
+                            "corresponding tabulation option."
+                        ),
+                    )
+                )
+                continue
+
+            if option is not None and column is None:
+                results.append(
+                    OptionValidationResult(
+                        option_label=option.label,
+                        raw_variable=None,
+                        raw_value=target_rank,
+                        reported_value=option.reported_value,
+                        reported_percentage=option.reported_percentage,
+                        calculated_count=None,
+                        calculated_percentage=None,
+                        difference=None,
+                        status=ValidationStatus.UNMATCHED,
+                        message=(
+                            "No raw ranking option variable exists at "
+                            "this displayed position."
+                        ),
+                    )
+                )
+                continue
+
+            count = int(
+                dataframe[column].apply(
+                    lambda value: self._to_finite_number(value)
+                    == target_rank
+                ).sum()
+            )
+            percentage = self._calculate_percentage(
+                count, respondent_base
+            )
+            difference, status = self._compare_percentage(
+                reported_percentage=option.reported_percentage,
+                calculated_percentage=percentage,
+            )
+            message = (
+                f"Mapped by position: {column} is option {index + 1}; "
+                f"counted responses coded {target_rank}."
+            )
+            if invalid_count:
+                status = ValidationStatus.FAIL
+                message += (
+                    " The ranking family contains invalid populated "
+                    "codes, so this option cannot fully pass."
+                )
+
+            results.append(
+                OptionValidationResult(
+                    option_label=option.label,
+                    raw_variable=column,
+                    raw_value=target_rank,
+                    reported_value=option.reported_value,
+                    reported_percentage=option.reported_percentage,
+                    calculated_count=count,
+                    calculated_percentage=percentage,
+                    difference=difference,
+                    status=status,
+                    message=message,
+                )
+            )
+
+        return results, messages
 
     def _validate_multi_select(
         self,
@@ -315,6 +493,7 @@ class TabulationValidationEngine:
         raw_variable: str,
         table: TabulationTable,
         respondent_base: int,
+        mapping_label: str = "Single-select response codes",
     ) -> tuple[list[OptionValidationResult], list[str]]:
         """
         Map code 1 to the first displayed option, code 2 to the second,
@@ -323,8 +502,8 @@ class TabulationValidationEngine:
         options = list(table.options)
         number_of_options = len(options)
         messages = [
-            "Single-select response codes were mapped by displayed "
-            "option order: 1 = first option, 2 = second option, etc."
+            f"{mapping_label} were mapped by displayed option order: "
+            "1 = first option, 2 = second option, etc."
         ]
 
         valid_codes, invalid_values, invalid_count = (

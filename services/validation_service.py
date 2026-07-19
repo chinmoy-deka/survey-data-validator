@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import copy
 import re
 from collections import Counter, defaultdict
 
 from core.models import (
     QuestionFamily,
+    QuestionType,
     SurveyProject,
     TableValidationResult,
 )
@@ -78,10 +80,19 @@ class ValidationService:
                 ),
             )
 
+            validation_family = self._prepare_family_for_table(
+                family=family,
+                occurrence_index=occurrence_index,
+                total_occurrences=table_id_counts.get(
+                    normalized_id,
+                    1,
+                ),
+            )
+
             result = engine.validate_table(
                 dataframe=raw_dataframe,
                 table=table,
-                family=family,
+                family=validation_family,
             )
 
             results.append(result)
@@ -148,10 +159,16 @@ class ValidationService:
             respondent_tolerance=respondent_tolerance,
         )
 
+        validation_family = self._prepare_family_for_table(
+            family=family,
+            occurrence_index=occurrence_index,
+            total_occurrences=total_occurrences,
+        )
+
         return engine.validate_table(
             dataframe=raw_dataframe,
             table=table,
-            family=family,
+            family=validation_family,
         )
 
     @staticmethod
@@ -289,6 +306,17 @@ class ValidationService:
             [],
         )
 
+        # A tabulation-confirmed ranking uses one exact raw family for
+        # all repeated rank tables. A temporary one-column family is
+        # created later for each table occurrence.
+        ranking_matches = [
+            family
+            for family in exact_matches
+            if self._get_final_type(family) == QuestionType.RANKING
+        ]
+        if len(ranking_matches) == 1:
+            return ranking_matches[0]
+
         # Repeated base IDs represent separate grid rows in table order.
         if total_occurrences > 1 and row_candidates:
             if occurrence_index < len(row_candidates):
@@ -329,6 +357,57 @@ class ValidationService:
             match.group("qid"),
             int(match.group("row")),
         )
+
+
+    def _prepare_family_for_table(
+        self,
+        family: QuestionFamily | None,
+        occurrence_index: int,
+        total_occurrences: int,
+    ) -> QuestionFamily | None:
+        """Create a temporary ranking family for one rank table.
+
+        The original ranking family keeps all option columns. Each
+        temporary copy carries a target rank (1, 2, 3, ...) so the
+        validation engine counts that rank across every option column.
+        """
+        if family is None:
+            return None
+
+        if self._get_final_type(family) != QuestionType.RANKING:
+            return family
+
+        rank_numbers = list(
+            family.metadata.get("rank_numbers", []) or []
+        )
+        if occurrence_index < len(rank_numbers):
+            target_rank = int(rank_numbers[occurrence_index])
+        else:
+            target_rank = occurrence_index + 1
+
+        temporary_family = copy.deepcopy(family)
+        temporary_family.name = f"{family.name}_rank{target_rank}"
+        temporary_family.detected_type = QuestionType.RANKING
+        temporary_family.confirmed_type = QuestionType.RANKING
+        temporary_family.structural_type = "ranking_item"
+        temporary_family.source_family_name = family.name
+        temporary_family.metadata["target_rank"] = target_rank
+        temporary_family.metadata["ranking_occurrence"] = (
+            occurrence_index + 1
+        )
+        temporary_family.metadata["ranking_source_family"] = family.name
+        return temporary_family
+
+    @staticmethod
+    def _get_final_type(family: QuestionFamily) -> QuestionType:
+        return family.confirmed_type or family.detected_type
+
+    @staticmethod
+    def _column_order(column_name: str) -> tuple[int, str]:
+        match = re.search(r"_(?:r|c)?(\d+)$", str(column_name), re.IGNORECASE)
+        if match:
+            return int(match.group(1)), str(column_name).lower()
+        return 10**9, str(column_name).lower()
 
     @staticmethod
     def _get_family_name(family: QuestionFamily) -> str:
