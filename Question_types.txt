@@ -1,0 +1,4 @@
+Single select type - 1 column with the qid - acceptable range will be 1 - n
+Multi select type - n numbers of column starting from CQ_1 to CQ_n - accepts in 0/1 format only
+Single select grid - Consider as individual single select question - if there are 5 rows then 5 single select qstn - format is qid_r1 to qid_rn
+Multi select grid - Consider indivisual multi select question - if there are 5 rows then 5 multi select qstns - format is qid_r1_c1 to qid_rn_cn 
